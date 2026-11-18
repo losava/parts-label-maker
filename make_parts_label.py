@@ -15,6 +15,7 @@ Usage:
 
 import argparse
 import csv
+import json
 import os
 import re
 import sys
@@ -62,6 +63,175 @@ BLU = "\033[94m"
 MAG = "\033[95m"
 CYN = "\033[96m"
 WHT = "\033[97m"
+
+APP_SETTINGS_NAME = "settings.json"
+
+
+def _is_frozen() -> bool:
+    """True when running from a PyInstaller build rather than the scripts."""
+    return bool(getattr(sys, "frozen", False))
+
+
+def bundle_dir() -> str:
+    """Folder the scripts or the installed program live in.
+
+    PARTS_LABEL_SEARCH_DIR overrides this for tests. Running the scripts from
+    the LABEL MAKER folder still looks for parts_list_clean.csv here.
+    """
+    override = os.environ.get("PARTS_LABEL_SEARCH_DIR")
+    if override:
+        return os.path.abspath(override)
+    if _is_frozen():
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def user_data_dir() -> str:
+    """Printer setting and saved paths. This folder survives uninstall.
+
+    Windows: %APPDATA%\\PartsLabel
+    Linux:   $XDG_DATA_HOME/parts-label-maker or ~/.local/share/parts-label-maker
+    macOS:   ~/Library/Application Support/PartsLabel
+    Override with PARTS_LABEL_DATA_DIR.
+    """
+    override = os.environ.get("PARTS_LABEL_DATA_DIR")
+    if override:
+        path = os.path.abspath(override)
+    elif sys.platform.startswith("win"):
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+        path = os.path.join(base, "PartsLabel")
+    elif sys.platform == "darwin":
+        path = os.path.join(
+            os.path.expanduser("~"), "Library", "Application Support", "PartsLabel"
+        )
+    else:
+        base = os.environ.get("XDG_DATA_HOME") or os.path.join(
+            os.path.expanduser("~"), ".local", "share"
+        )
+        path = os.path.join(base, "parts-label-maker")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def settings_path() -> str:
+    return os.path.join(user_data_dir(), APP_SETTINGS_NAME)
+
+
+def load_settings() -> dict:
+    path = settings_path()
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_settings(data: dict) -> None:
+    path = settings_path()
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2)
+            handle.write("\n")
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            if os.path.isfile(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+
+
+def app_version() -> str:
+    try:
+        from version import __version__
+        return __version__
+    except Exception:
+        return "0.0.0"
+
+
+def updates_on_startup() -> bool:
+    return bool(load_settings().get("check_updates_on_startup", True))
+
+
+def set_updates_on_startup(enabled: bool) -> None:
+    data = load_settings()
+    data["check_updates_on_startup"] = bool(enabled)
+    save_settings(data)
+
+
+def skipped_version() -> str:
+    return str(load_settings().get("skipped_version") or "")
+
+
+def set_skipped_version(tag: str) -> None:
+    data = load_settings()
+    data["skipped_version"] = (tag or "").strip()
+    save_settings(data)
+
+
+def set_parts_csv(path: str) -> None:
+    """Remember which parts list to use, including an existing LABEL MAKER file."""
+    data = load_settings()
+    data["parts_csv"] = os.path.abspath(path)
+    save_settings(data)
+
+
+def configured_parts_csv() -> str:
+    """Saved parts-list path, even when the file is missing. Empty if unset."""
+    return str(load_settings().get("parts_csv") or "").strip()
+
+
+def _legacy_csv_candidates() -> list[str]:
+    root = bundle_dir()
+    names = [
+        "parts_list_clean.csv",
+        os.path.join("Parts List", "parts_list_clean.csv"),
+        "FULL PARTS LIST",
+        os.path.join("Parts List", "FULL PARTS LIST"),
+    ]
+    return [os.path.join(root, name) for name in names]
+
+
+def _remember_clean_csv(path: str) -> None:
+    """Stick to a parts_list_clean.csv found beside the scripts.
+
+    Remembering it is what keeps the installed app on the shop file after an
+    upgrade. The older FULL PARTS LIST export is not remembered, so updates
+    still go to parts_list_clean.csv the way they always have.
+    """
+    if os.path.basename(path) != "parts_list_clean.csv":
+        return
+    abs_path = os.path.abspath(path)
+    data = load_settings()
+    if data.get("parts_csv") == abs_path:
+        return
+    data["parts_csv"] = abs_path
+    save_settings(data)
+
+
+def read_saved_printer() -> str:
+    data = load_settings()
+    name = str(data.get("printer_name") or "").strip().strip('"')
+    if name:
+        return name
+    for path in (
+        os.path.join(user_data_dir(), "printer_name.txt"),
+        os.path.join(bundle_dir(), "printer_name.txt"),
+    ):
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                name = handle.read().strip().strip('"')
+            if name:
+                return name
+        except Exception:
+            continue
+    return ""
 
 
 def cprint(msg: str = "", color: str = RST) -> None:
@@ -391,52 +561,24 @@ def open_file(path: str) -> None:
 
 
 def find_zebra_printer() -> str | None:
-    """Find a Zebra GC420d (or similar) printer name on Windows."""
-    if not sys.platform.startswith("win"):
-        return None
-
-    # Optional override: printer_name.txt next to this script (one line)
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    override = os.path.join(script_dir, "printer_name.txt")
-    if os.path.isfile(override):
-        try:
-            with open(override, "r", encoding="utf-8") as f:
-                name = f.read().strip().strip('"')
-            if name:
-                return name
-        except Exception:
-            pass
-
-    try:
-        import win32print  # type: ignore
-        names = [p[2] for p in win32print.EnumPrinters(win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS)]
-        for n in names:
-            u = n.upper()
-            if "GC420" in u or "GC 420" in u:
-                return n
-        for n in names:
-            if "ZEBRA" in n.upper() or "ZDESIGNER" in n.upper():
-                return n
-        return None
-    except Exception:
-        # Fallback: PowerShell list
-        try:
-            import subprocess
-            r = subprocess.run(
-                ["powershell", "-NoProfile", "-Command",
-                 "Get-Printer | Select-Object -ExpandProperty Name"],
-                capture_output=True, text=True, timeout=15,
-            )
-            names = [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
-            for n in names:
-                u = n.upper()
-                if "GC420" in u or "GC 420" in u:
-                    return n
-            for n in names:
-                if "ZEBRA" in n.upper() or "ZDESIGNER" in n.upper():
-                    return n
-        except Exception:
-            pass
+    """Find a Zebra GC420d (or the saved printer) on Windows or CUPS."""
+    saved = read_saved_printer()
+    # On Windows the saved name wins even if the spooler list is empty,
+    # matching the old printer_name.txt override.
+    if sys.platform.startswith("win") and saved:
+        return saved
+    names = list_printers()
+    if saved and (not names or saved in names):
+        return saved
+    for n in names:
+        u = n.upper()
+        if "GC420" in u or "GC 420" in u:
+            return n
+    for n in names:
+        if "ZEBRA" in n.upper() or "ZDESIGNER" in n.upper():
+            return n
+    if saved:
+        return saved
     return None
 
 
@@ -562,23 +704,58 @@ def build_zpl(part_number: str, description: str, header_text: str = "", price_t
     return "\n".join(lines)
 
 
-def send_raw_to_printer(data: bytes, printer_name: str) -> bool:
-    """Send raw bytes (ZPL) to a Windows printer."""
+def _send_raw_windows(data: bytes, printer_name: str) -> bool:
     try:
         import win32print  # type: ignore
-        h = win32print.OpenPrinter(printer_name)
+        handle = win32print.OpenPrinter(printer_name)
         try:
-            win32print.StartDocPrinter(h, 1, ("Parts Label", None, "RAW"))
-            win32print.StartPagePrinter(h)
-            win32print.WritePrinter(h, data)
-            win32print.EndPagePrinter(h)
-            win32print.EndDocPrinter(h)
+            win32print.StartDocPrinter(handle, 1, ("Parts Label", None, "RAW"))
+            win32print.StartPagePrinter(handle)
+            win32print.WritePrinter(handle, data)
+            win32print.EndPagePrinter(handle)
+            win32print.EndDocPrinter(handle)
             return True
         finally:
-            win32print.ClosePrinter(h)
+            win32print.ClosePrinter(handle)
     except Exception as e:
         print(f"  (Raw print failed: {e})")
         return False
+
+
+def _send_raw_cups(data: bytes, printer_name: str) -> bool:
+    """Send raw ZPL with `lp -o raw`. Falls back to `lpr -l` only when lp is missing."""
+    import subprocess
+
+    def _run(cmd: list[str]) -> subprocess.CompletedProcess | None:
+        try:
+            return subprocess.run(cmd, input=data, capture_output=True, timeout=30)
+        except FileNotFoundError:
+            return None
+
+    try:
+        result = _run(["lp", "-d", printer_name, "-o", "raw", "-t", "Parts Label"])
+        if result is None:
+            result = _run(["lpr", "-P", printer_name, "-l", "-T", "Parts Label"])
+        if result is None:
+            print("  (Raw print failed: lp and lpr are not installed)")
+            return False
+    except Exception as e:
+        print(f"  (Raw print failed: {e})")
+        return False
+    if result.returncode == 0:
+        return True
+    err = (result.stderr or b"").decode("utf-8", "replace").strip()
+    print(f"  (Raw print failed: {err or 'printer command failed'})")
+    return False
+
+
+def send_raw_to_printer(data: bytes, printer_name: str) -> bool:
+    """Send raw ZPL. Windows uses win32print; Linux uses CUPS. Never raises."""
+    if not printer_name:
+        return False
+    if sys.platform.startswith("win"):
+        return _send_raw_windows(data, printer_name)
+    return _send_raw_cups(data, printer_name)
 
 
 DEFAULT_PRINTER = "ZDesigner GC420d (EPL)"
@@ -586,15 +763,7 @@ DEFAULT_PRINTER = "ZDesigner GC420d (EPL)"
 
 def pick_default_printer(names: list[str]) -> str:
     """Choose the startup printer: saved default, else ZDesigner GC420d."""
-    saved = ""
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    override = os.path.join(script_dir, "printer_name.txt")
-    if os.path.isfile(override):
-        try:
-            with open(override, "r", encoding="utf-8") as f:
-                saved = f.read().strip().strip('"')
-        except Exception:
-            saved = ""
+    saved = read_saved_printer()
     if saved and (not names or saved in names):
         return saved
     preferred = [
@@ -613,13 +782,24 @@ def pick_default_printer(names: list[str]) -> str:
     for n in names:
         if "ZEBRA" in n.upper() or "ZDESIGNER" in n.upper():
             return n
+    # Windows keeps the historical default name when nothing is installed yet.
+    # Linux uses a real CUPS queue when the user has not saved one.
+    if names and not saved and not sys.platform.startswith("win"):
+        return names[0]
     return saved or DEFAULT_PRINTER
 
 
-def list_printers() -> list[str]:
-    """Return installed printer names (Windows)."""
-    if not sys.platform.startswith("win"):
-        return []
+def _parse_lpstat_printers(text: str) -> list[str]:
+    """Pull queue names out of `lpstat -p` output."""
+    names: list[str] = []
+    for line in (text or "").splitlines():
+        match = re.match(r"^printer\s+(\S+)\s+", line.strip())
+        if match:
+            names.append(match.group(1))
+    return names
+
+
+def _list_windows_printers() -> list[str]:
     try:
         import win32print  # type: ignore
         flags = win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS
@@ -628,50 +808,87 @@ def list_printers() -> list[str]:
         pass
     try:
         import subprocess
-        r = subprocess.run(
+        result = subprocess.run(
             ["powershell", "-NoProfile", "-Command",
              "Get-Printer | Select-Object -ExpandProperty Name"],
             capture_output=True, text=True, timeout=15,
         )
-        return [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
+        return [ln.strip() for ln in result.stdout.splitlines() if ln.strip()]
     except Exception:
         return []
 
 
+def _list_cups_printers() -> list[str]:
+    """CUPS queues. Empty when lpstat is missing or the spooler is down."""
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["lpstat", "-p"],
+            capture_output=True, text=True, timeout=8,
+        )
+    except Exception:
+        return []
+    return _parse_lpstat_printers(result.stdout)
+
+
+def list_printers() -> list[str]:
+    """Installed printer names. Windows uses the spooler; Linux uses CUPS."""
+    if sys.platform.startswith("win"):
+        return _list_windows_printers()
+    return _list_cups_printers()
+
+
 def save_printer_choice(name: str) -> None:
-    """Remember the selected printer for the next launch."""
+    """Remember the selected printer outside the install folder.
+
+    Running from the scripts also refreshes printer_name.txt beside them,
+    which is where the original app stored it.
+    """
     name = (name or "").strip()
     if not name:
         return
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    path = os.path.join(script_dir, "printer_name.txt")
+    data = load_settings()
+    data["printer_name"] = name
+    save_settings(data)
     try:
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(name)
+        with open(os.path.join(user_data_dir(), "printer_name.txt"), "w", encoding="utf-8") as handle:
+            handle.write(name)
+    except Exception:
+        pass
+    if _is_frozen():
+        return
+    try:
+        with open(os.path.join(bundle_dir(), "printer_name.txt"), "w", encoding="utf-8") as handle:
+            handle.write(name)
     except Exception:
         pass
 
 
 def print_label(part_number: str, description: str, header: str = "", pdf_path: str = "", price: str = "", copies: int = 1, printer_name: str = "") -> None:
-    """Auto-print to Zebra GC420d. Tries ZPL raw, then PDF."""
-    if not sys.platform.startswith("win"):
-        return
+    """Auto-print to Zebra GC420d. Tries raw ZPL, then a PDF on Windows.
 
+    Linux sends the same ZPL to a CUPS queue (`lp -o raw`). A missing printer
+    or a missing lp/lpr command is reported and then skipped.
+    """
     printer = (printer_name or "").strip() or find_zebra_printer()
     if not printer:
         print("  (No GC420d/Zebra printer found — skipped auto-print)")
-        try:
-            import win32print  # type: ignore
-            flags = win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS
-            names = [p[2] for p in win32print.EnumPrinters(flags)]
-            if names:
-                print("  Printers Windows sees:")
-                for n in names:
-                    print(f"    - {n}")
-                print('  Tip: create printer_name.txt with the exact printer name.')
-        except Exception as e:
-            print(f"  (Could not list printers: {e})")
-            print("  Tip: run  python -m pip install pywin32")
+        if sys.platform.startswith("win"):
+            try:
+                import win32print  # type: ignore
+                flags = win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS
+                names = [p[2] for p in win32print.EnumPrinters(flags)]
+                if names:
+                    print("  Printers Windows sees:")
+                    for n in names:
+                        print(f"    - {n}")
+                    print("  Tip: pick the printer in the window, or set it with Set Default.")
+            except Exception as e:
+                print(f"  (Could not list printers: {e})")
+                print("  Tip: run  python -m pip install pywin32")
+        else:
+            print("  Linux printing uses CUPS. Add the GC420d, then pick it in the window.")
+            print("  A raw queue is the right kind for ZPL:  lp -d NAME -o raw")
         return
 
     # 1) Raw ZPL — most reliable for GC420d
@@ -680,9 +897,15 @@ def print_label(part_number: str, description: str, header: str = "", pdf_path: 
         if send_raw_to_printer(zpl.encode("utf-8"), printer):
             cprint(f"  Printed {copies}x to: {printer}", GRN)
             return
-        print("  ZPL print did not succeed, trying PDF...")
+        if sys.platform.startswith("win"):
+            print("  ZPL print did not succeed, trying PDF...")
+        else:
+            print("  ZPL print did not succeed.")
     except Exception as e:
         print(f"  ZPL error: {e}")
+
+    if not sys.platform.startswith("win"):
+        return
 
     # 2) PDF via PrintTo (repeat for copies)
     copies = max(1, int(copies))
@@ -726,8 +949,12 @@ def make_one_label(part_number: str, description: str, header: str = "", output:
 
     if not output:
         safe = sanitize_filename(part_number)
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        parts_dir = os.path.join(script_dir, "Parts List")
+        if _is_frozen():
+            # Keep generated PDFs out of the install folder so uninstall
+            # and upgrades do not take them with them.
+            parts_dir = os.path.join(user_data_dir(), "Parts List")
+        else:
+            parts_dir = os.path.join(bundle_dir(), "Parts List")
         os.makedirs(parts_dir, exist_ok=True)
         output = os.path.join(parts_dir, f"{safe}.pdf")
     else:
@@ -750,18 +977,30 @@ def make_one_label(part_number: str, description: str, header: str = "", output:
 
 
 def find_parts_csv() -> str | None:
-    """Look for parts_list_clean.csv next to the script or in Parts List."""
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    candidates = [
-        os.path.join(script_dir, "parts_list_clean.csv"),
-        os.path.join(script_dir, "Parts List", "parts_list_clean.csv"),
-        os.path.join(script_dir, "FULL PARTS LIST"),
-        os.path.join(script_dir, "Parts List", "FULL PARTS LIST"),
-    ]
-    for c in candidates:
-        if os.path.isfile(c):
-            return c
-    return None
+    """Locate the parts list.
+
+    A path saved in settings wins, including the existing LABEL MAKER file.
+    If that path is set but the file is missing, this does not switch to a
+    different list. With nothing saved yet, look beside the scripts the way
+    the original app did.
+    """
+    remembered = configured_parts_csv()
+    if remembered:
+        return remembered if os.path.isfile(remembered) else None
+
+    found_clean = None
+    found_any = None
+    for candidate in _legacy_csv_candidates():
+        if not os.path.isfile(candidate):
+            continue
+        if os.path.basename(candidate) == "parts_list_clean.csv" and found_clean is None:
+            found_clean = candidate
+        if found_any is None:
+            found_any = candidate
+    chosen = found_clean or found_any
+    if chosen and os.path.basename(chosen) == "parts_list_clean.csv":
+        _remember_clean_csv(chosen)
+    return chosen
 
 
 def load_parts_lookup() -> dict[str, dict]:
@@ -812,12 +1051,22 @@ def load_parts_lookup() -> dict[str, dict]:
 
 
 def get_clean_csv_path() -> str:
-    """Path to parts_list_clean.csv (create next to script if needed)."""
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    csv_path = find_parts_csv()
-    if csv_path and os.path.basename(csv_path) == "parts_list_clean.csv":
-        return csv_path
-    return os.path.join(script_dir, "parts_list_clean.csv")
+    """Path updates are written to.
+
+    A path already chosen always wins, so an upgrade cannot start a new empty
+    file. Otherwise keep the old rule: parts_list_clean.csv beside the scripts.
+    The installed app writes a brand-new list into the user data folder, and
+    only after someone asks for one.
+    """
+    remembered = configured_parts_csv()
+    if remembered:
+        return remembered
+    for candidate in _legacy_csv_candidates():
+        if os.path.isfile(candidate) and os.path.basename(candidate) == "parts_list_clean.csv":
+            return candidate
+    if _is_frozen():
+        return os.path.join(user_data_dir(), "parts_list_clean.csv")
+    return os.path.join(bundle_dir(), "parts_list_clean.csv")
 
 
 def update_parts_list(
@@ -851,6 +1100,12 @@ def update_parts_list(
         return  # nothing changed
 
     csv_path = get_clean_csv_path()
+    parent = os.path.dirname(csv_path)
+    if parent:
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except Exception:
+            pass
     is_new = key not in lookup
     fields = ["PartNo", "Description", "Price", "Header"]
 
@@ -1181,6 +1436,11 @@ def main() -> None:
     parser.add_argument(
         "-o", "--output",
         help="Output PDF path (default: auto-named from part number)",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"parts-label-maker {app_version()}",
     )
     args = parser.parse_args()
 

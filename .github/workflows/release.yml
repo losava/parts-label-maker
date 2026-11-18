@@ -1,0 +1,98 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: System libraries
+        run: sudo apt-get update && sudo apt-get install -y libtk8.6 libtcl8.6
+      - name: Unit tests
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pytest
+          python -m py_compile parts_label_app.py make_parts_label.py version.py updater.py
+          python -m pytest -q
+
+  linux:
+    needs: test
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: System libraries
+        run: sudo apt-get update && sudo apt-get install -y libtk8.6 libtcl8.6 libfuse2
+      - name: Build Linux packages
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+          bash packaging/linux/build-linux.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-packages
+          path: dist/packages/*
+          if-no-files-found: error
+
+  windows:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Python packages
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+      - name: Inno Setup
+        run: choco install innosetup --yes --no-progress
+      - name: Build installer
+        run: powershell -ExecutionPolicy Bypass -File packaging\windows\build-windows.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: dist/PartsLabel-Setup-*.exe
+          if-no-files-found: error
+
+  publish:
+    needs: [linux, windows]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+      - name: Collect installers
+        run: |
+          mkdir -p assets
+          find release-assets -type f \( -name '*.exe' -o -name '*.deb' -o -name '*.AppImage' -o -name '*.tar.gz' \) -exec cp -v {} assets/ \;
+          ls -lh assets
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: assets/*
+          body: |
+            Installers for Parts Label.
+
+            **Windows:** run `PartsLabel-Setup-….exe`. It installs for the current Windows user, adds Start Menu and desktop shortcuts, and includes an uninstaller. An administrator password is not required.
+
+            **Linux:** use the AppImage, the `.deb`, or the `.tar.gz` (run `install.sh` inside it).
+
+            Your parts list and printer setting are not inside these files. They stay in your user folder and are kept when you update or uninstall.
+
+            The app will not install this update by itself. In the app, Updates → Check for Updates, then click **Download & install** only if you want it.

@@ -10,7 +10,7 @@ import sys
 import tempfile
 import threading
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 try:
     from PIL import Image, ImageDraw, ImageFont, ImageTk
@@ -22,6 +22,12 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import make_parts_label as eng  # noqa: E402
+import updater  # noqa: E402
+
+try:
+    from version import __version__
+except ImportError:
+    __version__ = "0.0.0"
 
 BG = "#14181d"
 PANEL = "#1e242c"
@@ -37,7 +43,7 @@ BLUE = "#6cb6ff"
 class LabelApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("Parts Label")
+        self.title(f"Parts Label {__version__}")
         self.geometry("1280x980")
         self.minsize(1180, 860)
         self.after(10, self._center_window)
@@ -58,11 +64,25 @@ class LabelApp(tk.Tk):
         self.part_entry.focus_set()
         n = len(self.parts)
         self._log(f"Parts list loaded — {n} part{'s' if n != 1 else ''}.")
+        parts_path = eng.find_parts_csv()
+        if parts_path:
+            self._log(f"Parts list file: {parts_path}")
+        else:
+            remembered = eng.configured_parts_csv()
+            if remembered:
+                self._log(f"Parts list file is missing: {remembered}")
+            else:
+                self._log("No parts list selected yet.")
         self._log("Type a part number and press Enter to look it up.")
         self.after(120, self.draw_preview)
         self.after(200, self.refresh_printers)
         self._parts_mtime = self._parts_file_mtime()
         self.after(3000, self._watch_parts)
+        self._update_busy = False
+        self._update_win = None
+        self._parts_prompt = None
+        self.after(600, self._maybe_choose_parts_list)
+        self.after(2500, self._startup_update_check)
 
     def _dance(self) -> None:
         import math
@@ -192,6 +212,7 @@ class LabelApp(tk.Tk):
         style.map("Printer.TCombobox", fieldbackground=[("readonly", CARD)])
 
     def _build(self) -> None:
+        self._build_menu()
         top = tk.Frame(self, bg="#0f1318", height=72)
         top.pack(fill="x")
         top.pack_propagate(False)
@@ -210,6 +231,9 @@ class LabelApp(tk.Tk):
         self.dance = tk.Canvas(top, width=96, height=56, bg="#0f1318", highlightthickness=0, cursor="hand2")
         self.dance.pack(side="right", padx=(0, 4))
         self.dance.bind("<Button-1>", lambda e: self._fireworks())
+        self._btn(top, "UPDATES", lambda: self.check_for_updates(manual=True), "#3a4450", INK).pack(
+            side="right", padx=(0, 8)
+        )
         self._dance_t = 0
         self._boom = None
         self.after(200, self._dance)
@@ -1068,6 +1092,327 @@ class LabelApp(tk.Tk):
         fitted.thumbnail((cw - 8, ch - 8), resample)
         self._preview_photo = ImageTk.PhotoImage(fitted)
         c.create_image(cw // 2, ch // 2, anchor="center", image=self._preview_photo)
+
+
+    def _build_menu(self) -> None:
+        bar = tk.Menu(self)
+        self.config(menu=bar)
+
+        file_menu = tk.Menu(bar, tearoff=0)
+        file_menu.add_command(label="Choose Parts List…", command=self.choose_parts_list)
+        file_menu.add_command(label="Open Parts List Folder", command=self.open_parts_folder)
+        file_menu.add_command(label="Open Settings Folder", command=self.open_user_data)
+        file_menu.add_separator()
+        file_menu.add_command(label="Exit", command=self.destroy)
+        bar.add_cascade(label="File", menu=file_menu)
+
+        updates = tk.Menu(bar, tearoff=0)
+        updates.add_command(
+            label="Check for Updates",
+            command=lambda: self.check_for_updates(manual=True),
+        )
+        self._startup_check_var = tk.BooleanVar(value=eng.updates_on_startup())
+        updates.add_checkbutton(
+            label="Check for Updates on Startup",
+            variable=self._startup_check_var,
+            command=self._toggle_startup_updates,
+        )
+        bar.add_cascade(label="Updates", menu=updates)
+
+        help_menu = tk.Menu(bar, tearoff=0)
+        help_menu.add_command(label="About Parts Label", command=self.show_about)
+        bar.add_cascade(label="Help", menu=help_menu)
+
+    def _toggle_startup_updates(self) -> None:
+        enabled = bool(self._startup_check_var.get())
+        eng.set_updates_on_startup(enabled)
+        self._log("Startup update check " + ("on" if enabled else "off"))
+
+    def choose_parts_list(self) -> None:
+        path = filedialog.askopenfilename(
+            parent=self,
+            title="Choose parts_list_clean.csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        eng.set_parts_csv(path)
+        self._last_looked = ""
+        self.reload_parts(manual=True)
+        self._log(f"Parts list set to {path}")
+
+    def open_parts_folder(self) -> None:
+        path = eng.find_parts_csv() or eng.configured_parts_csv()
+        folder = os.path.dirname(path) if path else eng.user_data_dir()
+        if folder and os.path.isdir(folder):
+            eng.open_file(folder)
+        else:
+            messagebox.showinfo("Parts Label", "No parts list folder yet. Choose a parts list first.")
+
+    def open_user_data(self) -> None:
+        eng.open_file(eng.user_data_dir())
+
+    def show_about(self) -> None:
+        path = eng.find_parts_csv() or eng.configured_parts_csv() or "(none selected)"
+        messagebox.showinfo(
+            "About Parts Label",
+            f"Parts Label {__version__}\n\n"
+            "3 × 2 in labels with a Code 128 barcode\n"
+            "for a Zebra GC420d.\n\n"
+            f"Parts list:\n{path}\n\n"
+            f"Your settings:\n{eng.user_data_dir()}\n\n"
+            "Updates are optional. Nothing installs unless you click Download & install.",
+        )
+
+    def _maybe_choose_parts_list(self) -> None:
+        """Ask once when no list is selected. Never invents an empty shop file."""
+        if eng.find_parts_csv():
+            return
+        remembered = eng.configured_parts_csv()
+        win = tk.Toplevel(self)
+        self._parts_prompt = win
+        win.title("Choose your parts list")
+        win.configure(bg=BG)
+        win.transient(self)
+        win.resizable(False, False)
+        try:
+            win.grab_set()
+        except tk.TclError:
+            pass
+        if remembered:
+            text = (
+                "The parts list this app was using is not there anymore:\n\n"
+                f"{remembered}\n\n"
+                "Choose that file again if it moved. A new empty list is only "
+                "created if you ask for one."
+            )
+        else:
+            text = (
+                "Parts Label needs the CSV of part numbers, descriptions, and prices.\n\n"
+                "If this computer already has a LABEL MAKER folder, choose the "
+                "parts_list_clean.csv in that folder. Other shop tools keep editing "
+                "that same file, and this app will use it too.\n\n"
+                "Do not start a new empty list if that file is already on this computer."
+            )
+        tk.Label(
+            win, text="Where is the parts list?", bg=BG, fg=AMBER,
+            font=("Segoe UI", 16, "bold"),
+        ).pack(anchor="w", padx=18, pady=(16, 8))
+        tk.Label(
+            win, text=text, bg=BG, fg=INK, font=("Segoe UI", 11),
+            wraplength=520, justify="left",
+        ).pack(anchor="w", padx=18)
+
+        def close():
+            self._parts_prompt = None
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+
+        def choose():
+            path = filedialog.askopenfilename(
+                parent=win,
+                title="Choose parts_list_clean.csv",
+                filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            )
+            if not path:
+                return
+            eng.set_parts_csv(path)
+            close()
+            self.reload_parts(manual=True)
+            self._log(f"Parts list set to {path}")
+
+        def create_new():
+            if not messagebox.askokcancel(
+                "Parts Label",
+                "This creates an empty parts list in your personal folder.\n"
+                "It does not copy prices from the LABEL MAKER folder.\n\n"
+                "Continue?",
+                parent=win,
+            ):
+                return
+            path = os.path.join(eng.user_data_dir(), "parts_list_clean.csv")
+            if not os.path.isfile(path):
+                with open(path, "w", encoding="utf-8", newline="") as handle:
+                    handle.write("PartNo,Description,Price,Header\n")
+            eng.set_parts_csv(path)
+            close()
+            self.reload_parts(manual=True)
+            self._log(f"New empty parts list: {path}")
+
+        def later():
+            close()
+            self._log("No parts list selected. Use File → Choose Parts List when you are ready.")
+
+        row = tk.Frame(win, bg=BG)
+        row.pack(fill="x", padx=18, pady=16)
+        self._btn(row, "CHOOSE EXISTING FILE", choose, AMBER, "#1b1f24").pack(side="left", padx=(0, 8))
+        self._btn(row, "CREATE NEW EMPTY LIST", create_new, "#3a4450", INK).pack(side="left", padx=(0, 8))
+        self._btn(row, "NOT NOW", later, "#3a4450", INK).pack(side="left")
+        win.protocol("WM_DELETE_WINDOW", later)
+        win.update_idletasks()
+        win.geometry(f"+{self.winfo_rootx() + 80}+{self.winfo_rooty() + 80}")
+
+    def _startup_update_check(self) -> None:
+        prompt = getattr(self, "_parts_prompt", None)
+        if prompt is not None:
+            try:
+                if prompt.winfo_exists():
+                    self.after(1500, self._startup_update_check)
+                    return
+            except tk.TclError:
+                pass
+        if not eng.updates_on_startup():
+            return
+        self.check_for_updates(manual=False)
+
+    def check_for_updates(self, manual: bool = False) -> None:
+        """Ask GitHub if a newer release exists. Offline checks stay quiet unless asked."""
+        if self._update_busy:
+            return
+        self._update_busy = True
+        if manual:
+            self.status_var.set("Checking for updates…")
+            self._log("Checking GitHub for a newer version…")
+
+        def work():
+            release = updater.fetch_latest_release()
+            self.after(0, lambda: self._update_result(release, manual))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _update_result(self, release, manual: bool) -> None:
+        self._update_busy = False
+        if release is None:
+            if manual:
+                self.status_var.set("Offline")
+                self._log("Update check failed (offline or GitHub unavailable).")
+                messagebox.showinfo(
+                    "Parts Label",
+                    "Couldn't reach GitHub. You may be offline.\nThe app works without updates.",
+                )
+            return
+        remote = updater.release_version(release)
+        tag = str(release.get("tag_name") or remote)
+        if not updater.is_newer(remote, __version__):
+            if manual:
+                self.status_var.set("Up to date")
+                self._log(f"Parts Label {__version__} is the latest version.")
+                messagebox.showinfo(
+                    "Parts Label",
+                    f"Parts Label {__version__} is the latest version.",
+                )
+            return
+        if not manual and (tag == eng.skipped_version() or remote == eng.skipped_version()):
+            return
+        self.status_var.set(f"Update {remote}")
+        self._log(f"Update available: {remote}")
+        self._show_update_dialog(release)
+
+    def _show_update_dialog(self, release: dict) -> None:
+        existing = getattr(self, "_update_win", None)
+        if existing is not None:
+            try:
+                if existing.winfo_exists():
+                    existing.lift()
+                    return
+            except tk.TclError:
+                pass
+        remote = updater.release_version(release)
+        tag = str(release.get("tag_name") or remote)
+        win = tk.Toplevel(self)
+        self._update_win = win
+        win.title("Update available")
+        win.configure(bg=BG)
+        win.transient(self)
+        win.resizable(False, False)
+        tk.Label(
+            win, text=f"Parts Label {remote} is available", bg=BG, fg=AMBER,
+            font=("Segoe UI", 16, "bold"),
+        ).pack(anchor="w", padx=18, pady=(16, 4))
+        tk.Label(
+            win,
+            text=(
+                f"You are running {__version__}. "
+                "Nothing installs unless you click Download & install."
+            ),
+            bg=BG, fg=MUTED, font=("Segoe UI", 10), wraplength=520, justify="left",
+        ).pack(anchor="w", padx=18)
+        notes = tk.Text(
+            win, height=14, width=64, bg=CARD, fg=INK, relief="flat",
+            font=("Segoe UI", 10), wrap="word", highlightthickness=0,
+        )
+        notes.pack(fill="both", expand=True, padx=18, pady=12)
+        notes.insert("1.0", updater.release_notes(release))
+        notes.configure(state="disabled")
+        status = tk.StringVar(value="")
+        tk.Label(
+            win, textvariable=status, bg=BG, fg=GREEN, font=("Segoe UI", 10),
+        ).pack(anchor="w", padx=18)
+
+        def close():
+            self._update_win = None
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+
+        def skip():
+            eng.set_skipped_version(tag)
+            self._log(f"Skipped update {tag}")
+            close()
+
+        buttons = []
+
+        def set_buttons(state: str) -> None:
+            for button in buttons:
+                button.configure(state=state)
+
+        def finished(message: str, error: Exception | None) -> None:
+            set_buttons("normal")
+            if error:
+                status.set("Download failed")
+                self._log(f"Update download failed: {error}")
+                messagebox.showerror("Parts Label", str(error), parent=win)
+                return
+            status.set("Downloaded")
+            self._log(message.replace("\n", " "))
+            messagebox.showinfo("Parts Label", message, parent=win)
+
+        def download():
+            asset = updater.pick_asset(release)
+            if not asset:
+                messagebox.showinfo(
+                    "Parts Label",
+                    "This release has no installer for this computer yet.",
+                    parent=win,
+                )
+                return
+            status.set("Downloading… you still confirm the installer.")
+            set_buttons("disabled")
+
+            def work():
+                try:
+                    dest_dir = os.path.join(eng.user_data_dir(), "updates")
+                    path = updater.download_asset(asset, dest_dir)
+                    message = updater.launch_installer(path)
+                    self.after(0, lambda: finished(message, None))
+                except Exception as exc:
+                    self.after(0, lambda err=exc: finished("", err))
+
+            threading.Thread(target=work, daemon=True).start()
+
+        row = tk.Frame(win, bg=BG)
+        row.pack(fill="x", padx=18, pady=(8, 16))
+        buttons.append(self._btn(row, "Download & install", download, GREEN, "#102418"))
+        buttons.append(self._btn(row, "Not now", close, "#3a4450", INK))
+        buttons.append(self._btn(row, "Skip this version", skip, "#3a4450", INK))
+        for button in buttons:
+            button.pack(side="left", padx=(0, 8))
+        win.protocol("WM_DELETE_WINDOW", close)
+        win.update_idletasks()
+        win.geometry(f"580x480+{self.winfo_rootx() + 120}+{self.winfo_rooty() + 80}")
 
 
 def main() -> None:

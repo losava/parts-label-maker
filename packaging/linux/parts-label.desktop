@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Parts Label
+GenericName=Parts Label Maker
+Comment=Print 3x2 inch Code 128 parts labels
+Exec=parts-label
+Icon=parts-label
+Terminal=false
+Categories=Office;Utility;
+Keywords=zebra;barcode;label;parts;
+StartupWMClass=PartsLabel
