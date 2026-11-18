@@ -1,0 +1,23 @@
+# Real shop data — never commit prices, vendors, or a saved printer
+parts_list_clean.csv
+printer_name.txt
+FULL PARTS LIST
+Parts List/
+
+# Generated labels
+*.pdf
+
+# Python / build
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+*.spec
+*.manifest
+
+# Packaging output
+packaging/output/
